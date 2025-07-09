@@ -25,6 +25,7 @@ async fn main() -> Result<(), async_nats::Error> {
             // Then, on that `Stream` use method to create Consumer and bind to it too.
             .create_consumer(jetstream::consumer::pull::Config {
                 durable_name: Some(format!("consumer-{}", i)),
+                ack_policy: jetstream::consumer::AckPolicy::All,
                 ..Default::default()
             })
             .await?;
@@ -81,10 +82,14 @@ async fn main() -> Result<(), async_nats::Error> {
                 let mut messages = consumer.batch().max_messages(1000).messages().await.unwrap();
                 let mut consumed_count = 0;
                 
+                let mut idx = 0;
                 while let Some(message) = messages.next().await {
                     let message = message.unwrap();
                     // acknowledge the message
-                    message.ack().await.unwrap();
+                    if idx == 999 {
+                        message.ack().await.unwrap();
+                    }
+                    idx += 1;
                     consumed_count += 1;
                 }
                 
