@@ -4,14 +4,14 @@ use async_nats::jetstream::{
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
-use std::{env, time::Duration};
+use std::{env, time::Instant};
 use tokio::task::JoinSet;
 
 #[tokio::main]
 async fn main() -> Result<(), async_nats::Error> {
     let nats_url = env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-    let mut streams = Vec::with_capacity(5);
-    for i in 0..5 {
+    let mut streams = Vec::with_capacity(4);
+    for i in 0..=4 {
         let client = async_nats::connect(&nats_url).await?;
         let jetstream = jetstream::new(client);
         let stream_name = String::from(format!("EVENTS-{}", i));
@@ -43,39 +43,126 @@ async fn main() -> Result<(), async_nats::Error> {
 
     let mut join_set = JoinSet::new();
 
+    // We'll collect statistics from each task
+    
     // Spawn a task for each stream to publish messages concurrently
     for (idx, (stream, consumer)) in streams.into_iter().enumerate() {
         let stream_payload = payload.clone();
         join_set.spawn(async move {
+            // Statistics collections
+            let mut producer_latencies = Vec::with_capacity(1000 * 1000);
+            let mut consumer_latencies = Vec::with_capacity(1000);
+            let producer_start_time = Instant::now();
+            // Track overall timing for producers, consumers are measured per batch
+            let mut total_produced = 0;
+            let mut total_consumed = 0;
+            
             for _ in 0..1000 {
                 for i in 0..1000 {
+                    let msg_start = Instant::now();
                     let res = stream
                         .publish(format!("events.{}", idx), stream_payload.clone())
                         .await
                         .unwrap();
+                    
                     if i == 999 {
+                        // Get acknowledgment for the last message in each batch
                         res.await.unwrap();
                     }
+                    
+                    producer_latencies.push(msg_start.elapsed().as_micros() as u64);
+                    total_produced += 1;
                 }
-
+                
+                
+                // Consumer measurements
+                let consumer_batch_start = Instant::now();
                 let mut messages = consumer.batch().max_messages(1000).messages().await.unwrap();
+                let mut consumed_count = 0;
+                
                 while let Some(message) = messages.next().await {
                     let message = message.unwrap();
                     // acknowledge the message
                     message.ack().await.unwrap();
+                    consumed_count += 1;
                 }
+                
+                consumer_latencies.push(consumer_batch_start.elapsed().as_micros() as u64);
+                total_consumed += consumed_count;
             }
-            idx
+            
+            // Calculate overall stats for this stream
+            let total_producer_duration = producer_start_time.elapsed();
+            let producer_tput = total_produced as f64 / total_producer_duration.as_secs_f64();
+            
+            // Sort latencies for percentile calculation
+            producer_latencies.sort_unstable();
+            consumer_latencies.sort_unstable();
+            
+            // Calculate percentiles
+            let producer_p50 = producer_latencies[producer_latencies.len() / 2];
+            let producer_p99 = producer_latencies[(producer_latencies.len() * 99) / 100];
+            
+            let consumer_p50 = if !consumer_latencies.is_empty() {
+                consumer_latencies[consumer_latencies.len() / 2]
+            } else {
+                0
+            };
+            
+            let consumer_p99 = if !consumer_latencies.is_empty() {
+                consumer_latencies[(consumer_latencies.len() * 99) / 100]
+            } else {
+                0
+            };
+            
+            // Return the stats for this stream
+            (idx, 
+             total_produced, producer_tput, producer_p50, producer_p99,
+             total_consumed, producer_tput, consumer_p50, consumer_p99)
         });
     }
 
-    // Wait for all publishing tasks to complete
+    // Wait for all publishing tasks to complete and collect statistics
+    let mut all_stats = Vec::new();
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(stream_idx) => println!("stream {} completed", stream_idx),
+            Ok(stats) => {
+                let (idx, total_produced, producer_tput, producer_p50, producer_p99,
+                     total_consumed, consumer_tput, consumer_p50, consumer_p99) = stats;
+                println!("Stream {} completed", idx);
+                all_stats.push((idx, total_produced, producer_tput, producer_p50, producer_p99,
+                                total_consumed, consumer_tput, consumer_p50, consumer_p99));
+            },
             Err(e) => eprintln!("A stream task failed: {}", e),
         }
     }
+    
+    // Print summary statistics
+    println!("\n===== BENCHMARK RESULTS =====");
+    println!("Stream | Produced | Producer Throughput | P50 Latency (µs) | P99 Latency (µs) | Consumed | Consumer Throughput | P50 Latency (µs) | P99 Latency (µs)");
+    println!("-------|----------|-------------------|-----------------|-----------------|----------|-------------------|-----------------|------------------");
+    
+    let mut total_producer_throughput = 0.0;
+    let mut total_consumer_throughput = 0.0;
+    let mut max_producer_p99 = 0;
+    let mut max_consumer_p99 = 0;
+    
+    for (idx, total_produced, producer_tput, producer_p50, producer_p99,
+         total_consumed, consumer_tput, consumer_p50, consumer_p99) in all_stats {
+        println!("{:6} | {:8} | {:17} | {:16} | {:16} | {:8} | {:17} | {:16} | {:16}",
+                idx, total_produced, producer_tput as u64, producer_p50, producer_p99,
+                total_consumed, consumer_tput as u64, consumer_p50, consumer_p99);
+                
+        total_producer_throughput += producer_tput;
+        total_consumer_throughput += consumer_tput;
+        max_producer_p99 = max_producer_p99.max(producer_p99);
+        max_consumer_p99 = max_consumer_p99.max(consumer_p99);
+    }
+    
+    println!("-------|----------|-------------------|-----------------|-----------------|----------|-------------------|-----------------|------------------");
+    println!("TOTAL  |          | {:17} |                 | {:16} |          | {:17} |                 | {:16}",
+            total_producer_throughput as u64, max_producer_p99, total_consumer_throughput as u64, max_consumer_p99);
+    println!("========================================");
 
     Ok(())
 }
