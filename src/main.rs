@@ -58,8 +58,8 @@ async fn main() -> Result<(), async_nats::Error> {
             let mut total_consumed = 0;
             
             for _ in 0..1000 {
+                let msg_start = Instant::now();
                 for i in 0..1000 {
-                    let msg_start = Instant::now();
                     let res = stream
                         .publish(format!("events.{}", idx), stream_payload.clone())
                         .await
@@ -70,9 +70,10 @@ async fn main() -> Result<(), async_nats::Error> {
                         res.await.unwrap();
                     }
                     
-                    producer_latencies.push(msg_start.elapsed().as_micros() as u64);
                     total_produced += 1;
                 }
+                let batch_elapsed = msg_start.elapsed();
+                producer_latencies.push(batch_elapsed.as_micros() as u64);
                 
                 
                 // Consumer measurements
@@ -87,8 +88,10 @@ async fn main() -> Result<(), async_nats::Error> {
                     consumed_count += 1;
                 }
                 
-                consumer_latencies.push(consumer_batch_start.elapsed().as_micros() as u64);
+                let consumer_batch_elapsed = consumer_batch_start.elapsed();
+                consumer_latencies.push(consumer_batch_elapsed.as_micros() as u64);
                 total_consumed += consumed_count;
+                
             }
             
             // Calculate overall stats for this stream
@@ -115,10 +118,20 @@ async fn main() -> Result<(), async_nats::Error> {
                 0
             };
             
+            // Convert throughput to MBps (assuming 1KB payload)
+            let producer_mbps = producer_tput * 1000.0 / (1024.0 * 1024.0); // 1000 bytes per message / (1024*1024) for MB
+            let consumer_mbps = producer_tput * 1000.0 / (1024.0 * 1024.0);
+            
+            // Convert latencies from microseconds to milliseconds
+            let producer_p50_ms = producer_p50 as f64 / 1000.0;
+            let producer_p99_ms = producer_p99 as f64 / 1000.0;
+            let consumer_p50_ms = consumer_p50 as f64 / 1000.0;
+            let consumer_p99_ms = consumer_p99 as f64 / 1000.0;
+            
             // Return the stats for this stream
             (idx, 
-             total_produced, producer_tput, producer_p50, producer_p99,
-             total_consumed, producer_tput, consumer_p50, consumer_p99)
+             total_produced, producer_mbps, producer_p50_ms, producer_p99_ms,
+             total_consumed, consumer_mbps, consumer_p50_ms, consumer_p99_ms)
         });
     }
 
@@ -139,29 +152,30 @@ async fn main() -> Result<(), async_nats::Error> {
     
     // Print summary statistics
     println!("\n===== BENCHMARK RESULTS =====");
-    println!("Stream | Produced | Producer Throughput | P50 Latency (µs) | P99 Latency (µs) | Consumed | Consumer Throughput | P50 Latency (µs) | P99 Latency (µs)");
+    println!("Stream | Produced | Producer Throughput | P50 Latency (ms) | P99 Latency (ms) | Consumed | Consumer Throughput | P50 Latency (ms) | P99 Latency (ms)");
+    println!("       |          |       (MB/s)       |                  |                  |          |       (MB/s)       |                  |                  ");
     println!("-------|----------|-------------------|-----------------|-----------------|----------|-------------------|-----------------|------------------");
     
     let mut total_producer_throughput = 0.0;
     let mut total_consumer_throughput = 0.0;
-    let mut max_producer_p99 = 0;
-    let mut max_consumer_p99 = 0;
+    let mut max_producer_p99 = 0.0;
+    let mut max_consumer_p99 = 0.0;
     
-    for (idx, total_produced, producer_tput, producer_p50, producer_p99,
-         total_consumed, consumer_tput, consumer_p50, consumer_p99) in all_stats {
-        println!("{:6} | {:8} | {:17} | {:16} | {:16} | {:8} | {:17} | {:16} | {:16}",
-                idx, total_produced, producer_tput as u64, producer_p50, producer_p99,
-                total_consumed, consumer_tput as u64, consumer_p50, consumer_p99);
+    for (idx, total_produced, producer_mbps, producer_p50_ms, producer_p99_ms,
+         total_consumed, consumer_mbps, consumer_p50_ms, consumer_p99_ms) in all_stats {
+        println!("{:6} | {:8} | {:17.2} | {:16.2} | {:16.2} | {:8} | {:17.2} | {:16.2} | {:16.2}",
+                idx, total_produced, producer_mbps, producer_p50_ms, producer_p99_ms,
+                total_consumed, consumer_mbps, consumer_p50_ms, consumer_p99_ms);
                 
-        total_producer_throughput += producer_tput;
-        total_consumer_throughput += consumer_tput;
-        max_producer_p99 = max_producer_p99.max(producer_p99);
-        max_consumer_p99 = max_consumer_p99.max(consumer_p99);
+        total_producer_throughput += producer_mbps;
+        total_consumer_throughput += consumer_mbps;
+        max_producer_p99 = f64::max(max_producer_p99, producer_p99_ms);
+        max_consumer_p99 = f64::max(max_consumer_p99, consumer_p99_ms);
     }
     
     println!("-------|----------|-------------------|-----------------|-----------------|----------|-------------------|-----------------|------------------");
-    println!("TOTAL  |          | {:17} |                 | {:16} |          | {:17} |                 | {:16}",
-            total_producer_throughput as u64, max_producer_p99, total_consumer_throughput as u64, max_consumer_p99);
+    println!("TOTAL  |          | {:17.2} |                  | {:16.2} |          | {:17.2} |                  | {:16.2}",
+            total_producer_throughput, max_producer_p99, total_consumer_throughput, max_consumer_p99);
     println!("========================================");
 
     Ok(())
